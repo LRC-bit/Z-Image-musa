@@ -75,13 +75,46 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    with torch.amp.autocast("cuda", enabled=False):
-        x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(2)
-        x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-        return x_out.type_as(x_in)
+# def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+#     with torch.amp.autocast("cuda", enabled=False):
+#         x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
+#         freqs_cis = freqs_cis.unsqueeze(2)
+#         x_out = torch.view_as_real(x * freqs_cis).flatten(3)
+#         return x_out.type_as(x_in)
 
+def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    x_in: [Batch, Seq, Heads, HeadDim]
+    freqs_cis: [Batch, Seq, HeadDim//2, 2]  <-- 现在是一个实数张量，模拟复数
+    """
+    with torch.amp.autocast("cuda", enabled=False):
+        # 1. 准备输入 x: [..., HeadDim] -> [..., HeadDim//2, 2]
+        # x[..., 0] 是实部, x[..., 1] 是虚部
+        x = x_in.float().reshape(*x_in.shape[:-1], -1, 2)
+        
+        # 2. 准备频率: 确保维度对齐
+        # x 的形状: [Batch, Seq, Heads, Dim//2, 2]
+        # freqs 的形状: [Batch, Seq, Dim//2, 2] -> 需要扩充 Heads 维度
+        # freqs: [Batch, Seq, 1, Dim//2, 2]
+        if freqs_cis.ndim == 4: # 假设传入是 [B, S, D, 2]
+             freqs_cis = freqs_cis.unsqueeze(2)
+
+        # 3. 提取分量
+        # x_r, x_i: [..., Dim//2]
+        x_r, x_i = x.unbind(-1)
+        
+        # f_r (cos), f_i (sin): [..., Dim//2]
+        f_r, f_i = freqs_cis.unbind(-1)
+
+        # 4. 手动复数乘法
+        # (xr + i xi) * (fr + i fi) = (xr*fr - xi*fi) + i(xr*fi + xi*fr)
+        out_r = x_r * f_r - x_i * f_i
+        out_i = x_r * f_i + x_i * f_r
+
+        # 5. 组合并还原形状
+        x_out = torch.stack([out_r, out_i], dim=-1).flatten(3)
+        
+        return x_out.type_as(x_in)
 
 class ZImageAttention(nn.Module):
     _attention_backend = None
@@ -244,23 +277,52 @@ class RopeEmbedder:
                 freqs_cis.append(freqs_cis_i)
             return freqs_cis
 
+    # def __call__(self, ids: torch.Tensor):
+    #     assert ids.ndim == 2
+    #     assert ids.shape[-1] == len(self.axes_dims)
+    #     device = ids.device
+
+    #     if self.freqs_cis is None:
+    #         self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
+    #         self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+    #     else:
+    #         if self.freqs_cis[0].device != device:
+    #             self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+
+    #     result = []
+    #     for i in range(len(self.axes_dims)):
+    #         index = ids[:, i]
+    #         result.append(self.freqs_cis[i][index])
+    #     return torch.cat(result, dim=-1)
+
     def __call__(self, ids: torch.Tensor):
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
+        # 1. 预计算逻辑
         if self.freqs_cis is None:
-            self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+            # 假设 precompute_freqs_cis 依然产生复数
+            cis_list = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
+            
+            # 【关键修改】立即把复数转为 (..., 2) 的实数张量存储
+            # view_as_real 会把 complex64 变成 float32，形状末尾加个 2
+            self.freqs_cis = [torch.view_as_real(c.to(device)) for c in cis_list]
         else:
             if self.freqs_cis[0].device != device:
-                self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+                self.freqs_cis = [c.to(device) for c in self.freqs_cis]
 
+        # 2. 查表逻辑
         result = []
         for i in range(len(self.axes_dims)):
             index = ids[:, i]
+            # 【关键】因为现在是 float32，这里只是普通的 Tensor 索引，Musa 支持！
             result.append(self.freqs_cis[i][index])
-        return torch.cat(result, dim=-1)
+        
+        # 3. 拼接
+        # 现在的 result 是一个形状为 [Batch, ..., 2] 的列表
+        # 我们在倒数第二维（原本的特征维）拼接
+        return torch.cat(result, dim=-2)
 
 
 class ZImageTransformer2DModel(nn.Module):
