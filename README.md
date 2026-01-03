@@ -1,3 +1,5 @@
+rope embedding的complex float运算部分经过修改，在src/zimage/transformers.py下有中文注释，安装官方安装方法进行安装，在摩尔线程s4000上经过测试。
+
 <h1 align="center">⚡️- Image<br><sub><sup>An Efficient Image Generation Foundation Model with Single-Stream Diffusion Transformer</sup></sub></h1>
 
 <div align="center">
